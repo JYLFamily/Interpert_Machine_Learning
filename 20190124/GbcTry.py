@@ -6,7 +6,12 @@ import time
 import datetime
 import numpy as np
 import pandas as pd
+from category_encoders import TargetEncoder
+from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import KFold
+from bayes_opt import BayesianOptimization
 from xgboost import XGBRegressor
+
 from sklearn.externals import joblib
 np.random.seed(7)
 
@@ -25,8 +30,11 @@ class GbcTry(object):
 
         # transform data
         self.__numeric_columns, self.__categorical_columns = [None for _ in range(2)]
+        self.__encoder = None
 
         # model fit
+        self.__xgb_bo = None
+        self.__xgb_params = None
         self.__xgb = None
 
         # model predict
@@ -55,7 +63,6 @@ class GbcTry(object):
         self.__train_feature["MSZoning"] = self.__train_feature["MSZoning"].replace("C (all)", "C")
         self.__test_feature["MSZoning"] = self.__test_feature["MSZoning"].replace("C (all)", "C")
 
-        # categorical feature ------------------------------------
         # MSSubClass "_" MSZoning
         self.__train_feature["MSSubClass_MSZoning"] = (
             self.__train_feature["MSSubClass"].astype(str) + "_" + self.__train_feature["MSZoning"].astype(str))
@@ -268,21 +275,58 @@ class GbcTry(object):
         self.__categorical_columns = self.__train_feature.select_dtypes(include=object).columns.tolist()
         self.__numeric_columns = self.__train_feature.select_dtypes(exclude=object).columns.tolist()
 
-        for col in self.__categorical_columns:
-            self.__train_feature[col], indexer = self.__train_feature[col].factorize()
-            self.__test_feature[col] = indexer.get_indexer(self.__test_feature[col])
+        # encoder
+        self.__encoder = TargetEncoder()
+        self.__encoder.fit(self.__train_feature[self.__categorical_columns], self.__train_label)
+        self.__train_feature[self.__categorical_columns] = (
+            self.__encoder.transform(self.__train_feature[self.__categorical_columns]))
+        self.__test_feature[self.__categorical_columns] = (
+            self.__encoder.transform(self.__test_feature[self.__categorical_columns]))
 
-        self.__train_feature.to_csv("train_feature.csv", index=False)
-        self.__train_label.to_frame("SalePrice").to_csv("train_label.csv", index=False)
-        self.__test_feature.to_csv("test_feature.csv", index=False)
+        # self.__train_feature.to_csv("train_feature.csv", index=False)
+        # self.__train_label.to_frame("SalePrice").to_csv("train_label.csv", index=False)
+        # self.__test_feature.to_csv("test_feature.csv", index=False)
 
     def model_fit(self):
-        self.__xgb = XGBRegressor()
-        self.__xgb.fit(self.__train_feature, np.log1p(self.__train_label / self.__train_feature["LotArea"]))
+        def __cv(n_estimators, learning_rate, subsample, colsample_bytree):
+            val = cross_val_score(
+                XGBRegressor(
+                    n_estimators=max(int(round(n_estimators)), 1),
+                    learning_rate=max(min(learning_rate, 1.0), 0),
+                    subsample=max(min(subsample, 1.0), 0),
+                    colsample_bytree=max(min(colsample_bytree, 1.0), 0),
+                    n_jobs=-1,
+                    silent=True
+                ),
+                self.__train_feature,
+                np.log1p(self.__train_label),
+                scoring="neg_mean_squared_error",
+                cv=KFold(n_splits=3, shuffle=True, random_state=7)
+            ).mean()
+
+            return val
+
+        self.__xgb_params = {
+            "n_estimators": (450, 750),
+            "learning_rate": (0.001, 0.1),
+            "subsample": (0.6, 1),
+            "colsample_bytree": (0.6, 1)
+        }
+
+        self.__xgb_bo = BayesianOptimization(__cv, self.__xgb_params)
+        self.__xgb_bo.maximize( init_points=5, n_iter=25, alpha=1e-4)
+
+        self.__xgb = XGBRegressor(
+            n_estimators=max(int(round(self.__xgb_bo.res["max"]["max_params"]["n_estimators"])), 1),
+            learning_rate=max(min(self.__xgb_bo.res["max"]["max_params"]["learning_rate"], 1.0), 0),
+            subsample=max(min(self.__xgb_bo.res["max"]["max_params"]["subsample"], 1.0), 0),
+            colsample_bytree=max(min(self.__xgb_bo.res["max"]["max_params"]["colsample_bytree"], 1.0), 0)
+        )
+        self.__xgb.fit(self.__train_feature, np.log1p(self.__train_label))
 
     def model_predict(self):
         self.__sample_submission["SalePrice"] = (
-                np.expm1(self.__xgb.predict(self.__test_feature)) * self.__test_feature["LotArea"])
+                np.expm1(self.__xgb.predict(self.__test_feature)))
 
     def write_data(self):
         self.__sample_submission.to_csv(os.path.join(self.__output_path, "sample_submission.csv"), index=False)
